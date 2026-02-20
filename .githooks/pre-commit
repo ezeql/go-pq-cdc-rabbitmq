@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+echo "==> gofmt check..."
+unformatted=$(gofmt -l .)
+if [ -n "$unformatted" ]; then
+  echo "ERROR: the following files are not gofmt'd:"
+  echo "$unformatted"
+  echo "Run: gofmt -w ."
+  exit 1
+fi
+
+echo "==> golangci-lint check..."
+if ! command -v golangci-lint &>/dev/null; then
+  echo "WARNING: golangci-lint not found, skipping (run: make init/lint)"
+else
+  golangci-lint run -c .golangci.yml --timeout=5m
+fi
+
+echo "==> go vet..."
+go vet ./...
+
+echo "All checks passed."
