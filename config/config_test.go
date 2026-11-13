@@ -111,3 +111,27 @@ func TestSetDefault_Idempotent(t *testing.T) {
 	assert.Equal(t, url, cfg.RabbitMQ.URL)
 	assert.Equal(t, batchSize, cfg.RabbitMQ.PublisherBatchSize)
 }
+
+func TestValidateRejectsNegativeValues(t *testing.T) {
+	for name, mutate := range map[string]func(*config.Connector){
+		"batch size":  func(c *config.Connector) { c.RabbitMQ.PublisherBatchSize = -1 },
+		"ticker":      func(c *config.Connector) { c.RabbitMQ.PublisherBatchTickerDuration = -time.Second },
+		"max retries": func(c *config.Connector) { c.RabbitMQ.PublisherMaxRetries = -1 },
+		"reconnect":   func(c *config.Connector) { c.RabbitMQ.ReconnectInterval = -time.Second },
+	} {
+		t.Run(name, func(t *testing.T) {
+			c := config.Connector{}
+			mutate(&c)
+			c.SetDefault()
+			if c.Validate() == nil {
+				t.Fatal("expected a validation error")
+			}
+		})
+	}
+
+	c := config.Connector{}
+	c.SetDefault()
+	if err := c.Validate(); err != nil {
+		t.Fatalf("defaults must be valid: %v", err)
+	}
+}

@@ -21,6 +21,8 @@ func TestParseSize(t *testing.T) {
 		{name: "invalid number", input: "xmb", wantErr: ErrInvalidNumberFormat},
 		{name: "unknown unit", input: "10xb", wantErr: ErrUnknownUnit},
 		{name: "no unit", input: "10", wantErr: ErrInvalidSizeFormat},
+		{name: "decimal", input: "1.5mb", want: MB + MB/2},
+		{name: "too large", input: "20EB", wantErr: ErrTooLarge},
 	}
 
 	for _, tt := range tests {

@@ -24,6 +24,9 @@ func NewPublisher(
 	if err != nil {
 		return Publisher{}, fmt.Errorf("publisherBatchBytes parse: %w", err)
 	}
+	if batchBytes == 0 {
+		return Publisher{}, fmt.Errorf("publisherBatchBytes must be > 0")
+	}
 	if batchBytes > bytesize.Size(math.MaxInt64) {
 		return Publisher{}, fmt.Errorf("publisherBatchBytes exceeds maximum: %d", batchBytes)
 	}

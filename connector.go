@@ -66,6 +66,9 @@ type connector struct {
 
 func NewConnector(ctx context.Context, cfg config.Connector, handler Handler, options ...Option) (Connector, error) {
 	cfg.SetDefault()
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
 	rm := &connector{
 		cfg:     &cfg,
 		handler: handler,

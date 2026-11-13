@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"math"
 	"time"
 
@@ -106,4 +107,27 @@ func (c *Connector) SetDefault() {
 	for i := range c.RabbitMQ.Queues {
 		c.RabbitMQ.Queues[i].Durable = true
 	}
+}
+
+// Validate rejects values SetDefault keeps but the publisher cannot run with
+// (each would panic or stall the flush loop).
+func (c *Connector) Validate() error {
+	r := c.RabbitMQ
+	var err error
+	if r.PublisherBatchSize < 0 {
+		err = errors.Join(err, errors.New("rabbitmq.publisherBatchSize must be > 0"))
+	}
+	if r.PublisherBatchTickerDuration < 0 {
+		err = errors.Join(err, errors.New("rabbitmq.publisherBatchTickerDuration must be > 0"))
+	}
+	if r.PublisherMaxRetries < 0 {
+		err = errors.Join(err, errors.New("rabbitmq.publisherMaxRetries must be > 0"))
+	}
+	if r.ReconnectInterval < 0 || r.ReconnectMaxInterval < 0 || r.ReconnectMaxElapsed < 0 {
+		err = errors.Join(err, errors.New("rabbitmq reconnect durations must be >= 0"))
+	}
+	if r.ConnectionTimeout < 0 || r.Heartbeat < 0 {
+		err = errors.Join(err, errors.New("rabbitmq.connectionTimeout and rabbitmq.heartbeat must be >= 0"))
+	}
+	return err
 }
