@@ -21,13 +21,13 @@
 // # Configuration
 //
 // All RabbitMQ connection and publisher settings live in [config.Connector].
-// Call [config.Connector.SetDefault] to apply sane defaults before use.
+// [NewConnector] applies [config.Connector.SetDefault] for unset fields.
 //
 // # Routing keys
 //
 // By default each message is published with the routing key
-// "<schema>.<table>". Use [config.RabbitMQ.TableRoutingKeyMapping] to override
-// the mapping per table.
+// "<schema>.<table>.<OPERATION>". Use [config.RabbitMQ.TableRoutingKeyMapping]
+// to override it per table; with a mapping set, unmapped tables are skipped.
 //
 // # Metrics
 //

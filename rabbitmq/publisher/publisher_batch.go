@@ -2,8 +2,10 @@ package publisher
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Trendyol/go-pq-cdc/logger"
@@ -18,8 +20,7 @@ type Batch struct {
 	responseHandler rabbitmq.ResponseHandler
 	batchTicker     *time.Ticker
 	lastChannel     *amqp.Channel
-	confirmTimeout  *time.Timer
-	confirmsCh      chan amqp.Confirmation
+	chClose         chan *amqp.Error
 	defaultExchange string
 	messages        []rabbitmq.PublishMessage
 	// acks holds every delivered message not yet acked. go-pq-cdc confirms the
@@ -36,7 +37,14 @@ type Batch struct {
 	pending bool
 	closed  bool
 	done    chan struct{}
+	// closing makes a flush stop retrying once Close has started.
+	closing atomic.Bool
 }
+
+const (
+	confirmTimeout  = 15 * time.Second
+	maxRetryBackoff = 5 * time.Second
+)
 
 func newBatch(
 	batchTime time.Duration,
@@ -48,8 +56,6 @@ func newBatch(
 	client rabbitmq.Client,
 	slotName string,
 ) *Batch {
-	t := time.NewTimer(15 * time.Second)
-	t.Stop()
 	return &Batch{
 		batchTickerDuration: batchTime,
 		batchTicker:         time.NewTicker(batchTime),
@@ -62,7 +68,6 @@ func newBatch(
 		responseHandler:     responseHandler,
 		defaultExchange:     defaultExchange,
 		client:              client,
-		confirmTimeout:      t,
 		done:                make(chan struct{}),
 	}
 }
@@ -83,6 +88,7 @@ func (b *Batch) StartBatchTicker() {
 // Close flushes what is buffered and stops publishing. Rows delivered after
 // Close stay unacked and are redelivered on restart.
 func (b *Batch) Close() {
+	b.closing.Store(true)
 	b.FlushMessages()
 	b.flushLock.Lock()
 	defer b.flushLock.Unlock()
@@ -151,24 +157,29 @@ func (b *Batch) FlushMessages() {
 
 	var (
 		flushSuccess bool
-		confirmed    []amqp.Confirmation
+		acks         []bool
 		err          error
 	)
 	started := time.Now()
 
 	for attempt := 0; attempt < b.maxRetries; attempt++ {
-		confirmed, err = b.publishAndConfirm()
+		acks, err = b.publishAndConfirm()
 		if err == nil {
-			flushSuccess = b.handleConfirmations(confirmed)
+			flushSuccess = b.handleConfirmations(acks)
 			break
 		}
 		logger.Error("batch publish failed", "attempt", attempt+1, "error", err)
-		time.Sleep(time.Duration(attempt+1) * 100 * time.Millisecond)
+		if b.closing.Load() || isPermanent(err) {
+			break
+		}
+		time.Sleep(min(time.Duration(attempt+1)*100*time.Millisecond, maxRetryBackoff))
 	}
 
 	b.metric.SetBulkRequestProcessLatency(time.Since(started).Nanoseconds())
 
-	if !flushSuccess && err != nil {
+	// Shutting down: the batch stays unacked and is redelivered on restart; a
+	// fatal-error panic here would skip closing the stream and the client.
+	if !flushSuccess && err != nil && !b.closing.Load() {
 		b.handleResponseError(err)
 	}
 
@@ -194,44 +205,23 @@ func (b *Batch) FlushMessages() {
 	b.batchTicker.Reset(b.batchTickerDuration)
 }
 
-// getOrCreateConfirmsCh returns a persistent confirms listener for the current channel.
-// If the underlying AMQP channel has changed (e.g. after reconnect), it creates a new listener.
-// This avoids the amqp091-go listener accumulation bug where each NotifyPublish call
-// appends a new listener and the blocking send in confirms.confirm() deadlocks when
-// old listener channels fill up.
-func (b *Batch) getOrCreateConfirmsCh(ch *amqp.Channel) chan amqp.Confirmation {
-	if b.lastChannel == ch && b.confirmsCh != nil {
-		return b.confirmsCh
-	}
-	// Channel changed (reconnect or first call) — register a fresh listener.
-	// Size buffer to batch limit to avoid backpressure on the amqp091-go confirm dispatch goroutine.
-	bufSize := b.batchLimit
-	if bufSize > 4096 {
-		bufSize = 4096
-	}
-	if bufSize < 256 {
-		bufSize = 256
-	}
-	b.confirmsCh = make(chan amqp.Confirmation, bufSize)
-	ch.NotifyPublish(b.confirmsCh)
-	b.lastChannel = ch
-	return b.confirmsCh
-}
-
-func (b *Batch) publishAndConfirm() ([]amqp.Confirmation, error) {
+func (b *Batch) publishAndConfirm() ([]bool, error) {
 	ch := b.client.Channel()
 	if ch == nil {
 		return nil, fmt.Errorf("rabbitmq channel is nil")
 	}
 
-	confirmsCh := b.getOrCreateConfirmsCh(ch)
+	closeCh := b.closeNotify(ch)
 
+	// One deferred confirmation per publish: no shared listener, so a confirm
+	// left over from a timed-out attempt can never be counted for another row.
+	confirms := make([]confirmation, len(b.messages))
 	for i := range b.messages {
 		ex := b.defaultExchange
 		if b.messages[i].Exchange != "" {
 			ex = b.messages[i].Exchange
 		}
-		if err := ch.PublishWithContext(context.Background(), ex, b.routingKeys[i], false, false, amqp.Publishing{
+		dc, err := ch.PublishWithDeferredConfirm(ex, b.routingKeys[i], false, false, amqp.Publishing{
 			ContentType:  b.messages[i].ContentType,
 			DeliveryMode: getDeliveryMode(b.messages[i].DeliveryMode),
 			Headers:      amqp.Table(b.messages[i].Headers),
@@ -240,39 +230,79 @@ func (b *Batch) publishAndConfirm() ([]amqp.Confirmation, error) {
 			Timestamp:    b.messages[i].Timestamp,
 			Type:         b.messages[i].Type,
 			AppId:        b.messages[i].AppID,
-		}); err != nil {
+		})
+		if err != nil {
 			return nil, err
 		}
+		if dc == nil {
+			return nil, fmt.Errorf("rabbitmq channel is not in confirm mode")
+		}
+		confirms[i] = dc
 	}
-
-	confirmed := make([]amqp.Confirmation, 0, len(b.messages))
-	if !b.confirmTimeout.Stop() {
+	acks, err := waitConfirms(confirms, confirmTimeout, ch.IsClosed)
+	if errors.Is(err, amqp.ErrClosed) {
+		// Prefer the broker's reason (e.g. 404 for a missing exchange) so a
+		// permanent error is not retried forever as a plain disconnect.
 		select {
-		case <-b.confirmTimeout.C:
+		case e := <-closeCh:
+			if e != nil {
+				return nil, e
+			}
 		default:
 		}
 	}
-	b.confirmTimeout.Reset(15 * time.Second)
-	defer b.confirmTimeout.Stop()
-	for i := 0; i < len(b.messages); i++ {
-		select {
-		case c := <-confirmsCh:
-			confirmed = append(confirmed, c)
-		case <-b.confirmTimeout.C:
-			return nil, fmt.Errorf("timeout while waiting publisher confirms")
-		}
-	}
-	return confirmed, nil
+	return acks, err
 }
 
-func (b *Batch) handleConfirmations(confirmed []amqp.Confirmation) bool {
+// isPermanent reports channel errors a retry cannot fix.
+func isPermanent(err error) bool {
+	var e *amqp.Error
+	return errors.As(err, &e) && (e.Code == amqp.NotFound || e.Code == amqp.AccessRefused || e.Code == amqp.PreconditionFailed)
+}
+
+// closeNotify returns a close listener registered once per channel; amqp091
+// sends at most one error to it, so the 1-slot buffer never blocks it.
+func (b *Batch) closeNotify(ch *amqp.Channel) chan *amqp.Error {
+	if ch != b.lastChannel {
+		b.lastChannel = ch
+		b.chClose = ch.NotifyClose(make(chan *amqp.Error, 1))
+	}
+	return b.chClose
+}
+
+type confirmation interface {
+	WaitContext(ctx context.Context) (bool, error)
+}
+
+// waitConfirms waits for every confirmation under one deadline. amqp091 nacks
+// every pending confirmation when the channel closes, so a nack on a closed
+// channel is returned as amqp.ErrClosed (retried), not as a broker nack.
+func waitConfirms(confirms []confirmation, timeout time.Duration, closed func() bool) ([]bool, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	acks := make([]bool, len(confirms))
+	for i, c := range confirms {
+		ack, err := c.WaitContext(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("waiting for publisher confirms: %w", err)
+		}
+		if !ack && closed() {
+			return nil, amqp.ErrClosed
+		}
+		acks[i] = ack
+	}
+	return acks, nil
+}
+
+func (b *Batch) handleConfirmations(acks []bool) bool {
 	flushSuccess := true
 	successCounts := make(map[string]float64, 4)
 	errCounts := make(map[string]float64, 4)
 	var rhCtx rabbitmq.ResponseHandlerContext
 
-	for i := range confirmed {
-		if confirmed[i].Ack {
+	for i, ack := range acks {
+		if ack {
 			successCounts[b.routingKeys[i]]++
 			if b.responseHandler != nil {
 				rhCtx.Message = &b.messages[i]
@@ -285,7 +315,7 @@ func (b *Batch) handleConfirmations(confirmed []amqp.Confirmation) bool {
 		errCounts[b.routingKeys[i]]++
 		if b.responseHandler != nil {
 			rhCtx.Message = &b.messages[i]
-			rhCtx.Err = fmt.Errorf("publisher nack, delivery_tag=%d", confirmed[i].DeliveryTag)
+			rhCtx.Err = fmt.Errorf("publisher nack, routing_key=%s", b.routingKeys[i])
 			b.responseHandler.OnError(&rhCtx)
 		}
 	}

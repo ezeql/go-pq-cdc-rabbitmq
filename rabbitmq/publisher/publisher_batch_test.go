@@ -1,6 +1,8 @@
 package publisher
 
 import (
+	"context"
+	"errors"
 	"log/slog"
 	"testing"
 	"time"
@@ -68,4 +70,44 @@ func TestBatchFailedFlushKeepsRowsAndAcks(t *testing.T) {
 
 	b.Close()
 	b.FlushMessages() // must return at once once closed
+}
+
+type fakeConfirm struct {
+	ack     bool
+	pending bool
+}
+
+func (f fakeConfirm) WaitContext(ctx context.Context) (bool, error) {
+	if f.pending {
+		<-ctx.Done()
+		return false, ctx.Err()
+	}
+	return f.ack, nil
+}
+
+func TestWaitConfirms(t *testing.T) {
+	open := func() bool { return false }
+	closed := func() bool { return true }
+
+	acks, err := waitConfirms([]confirmation{fakeConfirm{ack: true}, fakeConfirm{ack: false}}, time.Second, open)
+	if err != nil || !acks[0] || acks[1] {
+		t.Fatalf("broker nack must be reported per row, got %v %v", acks, err)
+	}
+
+	if _, err = waitConfirms([]confirmation{fakeConfirm{ack: false}}, time.Second, closed); !errors.Is(err, amqp.ErrClosed) {
+		t.Fatalf("nack on a closed channel must be retryable ErrClosed, got %v", err)
+	}
+
+	if _, err = waitConfirms([]confirmation{fakeConfirm{ack: true}, fakeConfirm{pending: true}}, 10*time.Millisecond, open); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("missing confirm must time out, got %v", err)
+	}
+}
+
+func TestIsPermanent(t *testing.T) {
+	if !isPermanent(&amqp.Error{Code: amqp.NotFound}) {
+		t.Fatal("404 from the broker cannot be fixed by retrying")
+	}
+	if isPermanent(amqp.ErrClosed) || isPermanent(context.DeadlineExceeded) {
+		t.Fatal("disconnects and timeouts must be retried")
+	}
 }

@@ -4,8 +4,10 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"math/rand/v2"
+	"net/url"
 	"sync"
 	"time"
 
@@ -162,6 +164,15 @@ func (c *client) connect() error {
 	}
 
 	c.mu.Lock()
+	select {
+	case <-c.closeCh:
+		// Close ran while this (re)connect was dialing: nobody would close these.
+		c.mu.Unlock()
+		_ = ch.Close()
+		_ = conn.Close()
+		return errors.New("rabbitmq client closed")
+	default:
+	}
 	prevCh := c.channel
 	prevConn := c.conn
 	c.conn = conn
@@ -189,16 +200,23 @@ func (c *client) dial() (*amqp.Connection, error) {
 	}
 
 	if c.cfg.RabbitMQ.TLS.Enabled {
+		// amqp091 only uses TLSClientConfig for amqps:// URLs; anything else
+		// would silently connect in plaintext.
+		if u, err := url.Parse(c.cfg.RabbitMQ.URL); err != nil || u.Scheme != "amqps" {
+			return nil, errors.New("rabbitmq tls.enabled requires an amqps:// url")
+		}
 		tlsCfg := &tls.Config{
 			MinVersion:         tls.VersionTLS12,
 			InsecureSkipVerify: c.cfg.RabbitMQ.TLS.Insecure, //nolint:gosec
 		}
 		if len(c.cfg.RabbitMQ.TLS.CACert) > 0 {
 			pool := x509.NewCertPool()
-			pool.AppendCertsFromPEM(c.cfg.RabbitMQ.TLS.CACert)
+			if !pool.AppendCertsFromPEM(c.cfg.RabbitMQ.TLS.CACert) {
+				return nil, errors.New("rabbitmq tls.caCert: no valid PEM certificate")
+			}
 			tlsCfg.RootCAs = pool
 		}
-		if len(c.cfg.RabbitMQ.TLS.Cert) > 0 && len(c.cfg.RabbitMQ.TLS.Key) > 0 {
+		if len(c.cfg.RabbitMQ.TLS.Cert) > 0 || len(c.cfg.RabbitMQ.TLS.Key) > 0 {
 			cert, err := tls.X509KeyPair(c.cfg.RabbitMQ.TLS.Cert, c.cfg.RabbitMQ.TLS.Key)
 			if err != nil {
 				return nil, err
@@ -272,15 +290,21 @@ func (c *client) declareTopology(ch *amqp.Channel) error {
 	return nil
 }
 
+// ConsumeOne waits for one message on queue and removes it. It polls with
+// basic.get so no other message is taken from the queue.
 func ConsumeOne(ctx context.Context, ch *amqp.Channel, queue string) (amqp.Delivery, error) {
-	msgs, err := ch.Consume(queue, "", true, false, false, false, nil)
-	if err != nil {
-		return amqp.Delivery{}, err
-	}
-	select {
-	case msg := <-msgs:
-		return msg, nil
-	case <-ctx.Done():
-		return amqp.Delivery{}, ctx.Err()
+	for {
+		msg, ok, err := ch.Get(queue, true)
+		if err != nil {
+			return amqp.Delivery{}, err
+		}
+		if ok {
+			return msg, nil
+		}
+		select {
+		case <-ctx.Done():
+			return amqp.Delivery{}, ctx.Err()
+		case <-time.After(50 * time.Millisecond):
+		}
 	}
 }

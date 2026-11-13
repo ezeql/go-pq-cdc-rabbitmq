@@ -88,7 +88,6 @@ func main() {
         }
         data["operation"] = string(msg.Type)
         payload, _ := json.Marshal(data)
-        }
         return []rabbitmq.PublishMessage{{Body: payload, ContentType: "application/json"}}
     })
     if err != nil {
@@ -114,6 +113,34 @@ Consumer services can bind their own queues independently:
 - `public.orders.INSERT` for a single operation
 
 This allows fan-out scenarios where multiple workers receive the same event copy.
+
+With `tableRoutingKeyMapping` set, only mapped tables are published; changes to
+any other table are acked and skipped. A static value gets `.{operation}`
+appended (`public.users` → `public.users.INSERT`); a template value
+(`{{.TableNamespace}}`, `{{.TableName}}`, `{{.Operation}}`) is used as rendered.
+Templates are checked when the connector is created.
+
+Partitions without their own mapping use the longest mapped prefix of their
+name split on `_` (`events_archive_2024` → `events_archive`). The match is by
+name only, so an unrelated table such as `users_audit` also routes as `users`
+when `users` is mapped.
+
+## Delivery guarantees
+
+Delivery is at-least-once. A replication position is acked only after RabbitMQ
+confirmed every row at or below it; a failed or unconfirmed batch is kept and
+retried, so consumers can see duplicates and should be idempotent. A broker
+nack is fatal with the default response handler.
+
+`cdc.heartbeat` is rejected: go-pq-cdc acks heartbeat rows itself, which
+confirms past rows still buffered in the publisher. Since go-pq-cdc v1.14 an
+idle slot advances on keepalives, which covers what the heartbeat was for.
+
+Known gap in go-pq-cdc, outside this connector's control:
+
+- **Initial snapshot:** go-pq-cdc marks a snapshot chunk done once its rows are
+  handed over, before they are published. A crash in that window loses those
+  rows; the end of the snapshot flushes what is buffered.
 
 ## Integration Tests
 
@@ -158,5 +185,5 @@ make test/benchmark
 
 ## Compatibility
 
-- PostgreSQL 14+
+- PostgreSQL 15+ (CI covers 15 to 18)
 - RabbitMQ 3+

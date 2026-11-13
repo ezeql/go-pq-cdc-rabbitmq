@@ -11,7 +11,7 @@ init/hooks:
 
 .PHONY: init/lint init/vulnCheck
 init/lint:
-	go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest
+	go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.15.0
 	go install golang.org/x/tools/go/analysis/passes/fieldalignment/cmd/fieldalignment@latest
 
 .PHONY: init/vulnCheck
@@ -37,7 +37,6 @@ tidy:
 .PHONY: tidy/all
 tidy/all:
 	go mod tidy
-	cd example/simple && go mod tidy && cd ../..
 
 .PHONY: test/integration
 test/integration:
