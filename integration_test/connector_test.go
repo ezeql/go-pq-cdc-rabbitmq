@@ -109,7 +109,7 @@ func TestConnector_AckMechanism(t *testing.T) {
 	defer db.Close()
 	mustCreateUsersTable(t, db)
 
-	// Use default batch size (10) and a fast ticker to flush quickly.
+	// Use the test config's batch size (10) and a fast ticker to flush quickly.
 	// Batch size 2 caused a race between the batch-size trigger and the ticker,
 	// making this test flaky.
 	cfg := newTestConfig("users_ack_exchange", "users_ack_queue", "users_ack_slot", "users_ack_pub")

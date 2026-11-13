@@ -36,4 +36,4 @@ jobs:
         run: make build/linux
 
       - name: Unit Test
-        run: go test -v ./...
+        run: go test -race -v $(go list ./... | grep -v /integration_test)
