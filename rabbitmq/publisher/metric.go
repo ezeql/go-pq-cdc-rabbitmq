@@ -6,7 +6,11 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 )
 
-const namespace = "go_pq_cdc_rabbitmq"
+const (
+	namespace     = "go_pq_cdc_rabbitmq"
+	labelHost     = "host"
+	labelSlotName = "slot_name"
+)
 
 type Metric interface {
 	SetProcessLatency(latency int64)
@@ -35,8 +39,8 @@ func NewMetric(slotName string) Metric {
 			Name:      "current",
 			Help:      "latest rabbitmq connector process latency in nanoseconds",
 			ConstLabels: prometheus.Labels{
-				"host":      hostname,
-				"slot_name": slotName,
+				labelHost:     hostname,
+				labelSlotName: slotName,
 			},
 		}),
 		bulkRequestProcessLatencyNs: prometheus.NewGauge(prometheus.GaugeOpts{
@@ -45,8 +49,8 @@ func NewMetric(slotName string) Metric {
 			Name:      "current",
 			Help:      "latest rabbitmq connector bulk request process latency in nanoseconds",
 			ConstLabels: prometheus.Labels{
-				"host":      hostname,
-				"slot_name": slotName,
+				labelHost:     hostname,
+				labelSlotName: slotName,
 			},
 		}),
 		totalSuccess: prometheus.NewCounterVec(prometheus.CounterOpts{
@@ -54,13 +58,13 @@ func NewMetric(slotName string) Metric {
 			Subsystem: "publish",
 			Name:      "total",
 			Help:      "total number of successful publish operation to rabbitmq",
-		}, []string{"slot_name", "routing_key", "host"}),
+		}, []string{labelSlotName, "routing_key", labelHost}),
 		totalErr: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: namespace,
 			Subsystem: "err",
 			Name:      "total",
 			Help:      "total number of error in publish operation to rabbitmq",
-		}, []string{"slot_name", "routing_key", "host"}),
+		}, []string{labelSlotName, "routing_key", labelHost}),
 	}
 }
 
