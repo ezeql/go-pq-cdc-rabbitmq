@@ -3,7 +3,7 @@ module github.com/ezeql/go-pq-cdc-rabbitmq
 go 1.26
 
 require (
-	github.com/Trendyol/go-pq-cdc v1.6.8
+	github.com/Trendyol/go-pq-cdc v1.14.16
 	github.com/docker/go-connections v0.6.0
 	github.com/lib/pq v1.10.9
 	github.com/prometheus/client_golang v1.23.2
@@ -37,8 +37,8 @@ require (
 	github.com/go-playground/errors v3.3.0+incompatible // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/jackc/pgpassfile v1.0.0 // indirect
-	github.com/jackc/pgservicefile v0.0.0-20231201235250-de7065d80cb9 // indirect
-	github.com/jackc/pgx/v5 v5.6.0 // indirect
+	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
+	github.com/jackc/pgx/v5 v5.9.2 // indirect
 	github.com/klauspost/compress v1.18.0 // indirect
 	github.com/lufia/plan9stats v0.0.0-20211012122336-39d0f177ccd0 // indirect
 	github.com/magiconair/properties v1.8.10 // indirect
