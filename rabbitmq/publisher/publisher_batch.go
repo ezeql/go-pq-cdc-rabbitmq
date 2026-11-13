@@ -2,6 +2,7 @@ package publisher
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -18,6 +19,8 @@ type Batch struct {
 	client          rabbitmq.Client
 	responseHandler rabbitmq.ResponseHandler
 	batchTicker     *time.Ticker
+	lastChannel     *amqp.Channel
+	chClose         chan *amqp.Error
 	defaultExchange string
 	messages        []rabbitmq.PublishMessage
 	// acks holds every delivered message not yet acked. go-pq-cdc confirms the
@@ -123,14 +126,6 @@ func (b *Batch) AddEvents(
 	eventTime time.Time,
 	isLastChunk bool,
 ) {
-	for i := range messages {
-		// amqp rejects these at publish time; retrying cannot fix them and would
-		// republish the rows before it forever, so fail before buffering.
-		if err := amqp.Table(messages[i].Headers).Validate(); err != nil {
-			panic(fmt.Errorf("invalid AMQP headers for routing key %q: %w", messages[i].RoutingKey, err))
-		}
-	}
-
 	b.flushLock.Lock()
 	for i := range messages {
 		b.messages = append(b.messages, messages[i])
@@ -174,15 +169,17 @@ func (b *Batch) FlushMessages() {
 			break
 		}
 		logger.Error("batch publish failed", "attempt", attempt+1, "error", err)
-		if b.closing.Load() {
-			break // shutting down: the batch stays unacked and is redelivered on restart
+		if b.closing.Load() || isPermanent(err) {
+			break
 		}
 		time.Sleep(min(time.Duration(attempt+1)*100*time.Millisecond, maxRetryBackoff))
 	}
 
 	b.metric.SetBulkRequestProcessLatency(time.Since(started).Nanoseconds())
 
-	if !flushSuccess && err != nil {
+	// Shutting down: the batch stays unacked and is redelivered on restart; a
+	// fatal-error panic here would skip closing the stream and the client.
+	if !flushSuccess && err != nil && !b.closing.Load() {
 		b.handleResponseError(err)
 	}
 
@@ -214,6 +211,8 @@ func (b *Batch) publishAndConfirm() ([]bool, error) {
 		return nil, fmt.Errorf("rabbitmq channel is nil")
 	}
 
+	closeCh := b.closeNotify(ch)
+
 	// One deferred confirmation per publish: no shared listener, so a confirm
 	// left over from a timed-out attempt can never be counted for another row.
 	confirms := make([]confirmation, len(b.messages))
@@ -240,7 +239,35 @@ func (b *Batch) publishAndConfirm() ([]bool, error) {
 		}
 		confirms[i] = dc
 	}
-	return waitConfirms(confirms, confirmTimeout, ch.IsClosed)
+	acks, err := waitConfirms(confirms, confirmTimeout, ch.IsClosed)
+	if errors.Is(err, amqp.ErrClosed) {
+		// Prefer the broker's reason (e.g. 404 for a missing exchange) so a
+		// permanent error is not retried forever as a plain disconnect.
+		select {
+		case e := <-closeCh:
+			if e != nil {
+				return nil, e
+			}
+		default:
+		}
+	}
+	return acks, err
+}
+
+// isPermanent reports channel errors a retry cannot fix.
+func isPermanent(err error) bool {
+	var e *amqp.Error
+	return errors.As(err, &e) && (e.Code == amqp.NotFound || e.Code == amqp.AccessRefused || e.Code == amqp.PreconditionFailed)
+}
+
+// closeNotify returns a close listener registered once per channel; amqp091
+// sends at most one error to it, so the 1-slot buffer never blocks it.
+func (b *Batch) closeNotify(ch *amqp.Channel) chan *amqp.Error {
+	if ch != b.lastChannel {
+		b.lastChannel = ch
+		b.chClose = ch.NotifyClose(make(chan *amqp.Error, 1))
+	}
+	return b.chClose
 }
 
 type confirmation interface {

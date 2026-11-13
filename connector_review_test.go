@@ -56,3 +56,32 @@ func TestListener_SkipsSnapshotMarkers(t *testing.T) {
 		assert.True(t, acked, "%s marker not acked", ev)
 	}
 }
+
+// A header amqp cannot encode must fail before any chunk of the event is
+// buffered: a later chunk failing would republish the earlier ones forever.
+func TestListener_RejectsInvalidHeadersBeforeBuffering(t *testing.T) {
+	cfg := config.Connector{}
+	cfg.SetDefault()
+	cfg.RabbitMQ.PublisherBatchSize = 1 // two events -> two chunks
+	pub, err := publisher.NewPublisher(nil, &cfg, &rabbitmq.DefaultResponseHandler{})
+	require.NoError(t, err)
+	defer pub.PublisherBatch.Close()
+
+	c := newRoutingTestConnector(cfg)
+	c.publisher = pub
+	c.handler = func(*Message) []rabbitmq.PublishMessage {
+		return []rabbitmq.PublishMessage{{Body: []byte("ok")}, {Headers: map[string]any{"lsn": uint64(1)}}}
+	}
+
+	// With a nil client, buffering the first chunk would flush and panic on a
+	// nil pointer; getting the header error proves validation ran first.
+	defer func() {
+		err, _ := recover().(error)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "invalid AMQP headers")
+	}()
+	c.listener(&replication.ListenerContext{
+		Message: &format.Insert{TableNamespace: "public", TableName: "users"},
+		Ack:     func() error { return nil },
+	})
+}

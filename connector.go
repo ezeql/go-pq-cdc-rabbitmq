@@ -19,6 +19,7 @@ import (
 	"github.com/ezeql/go-pq-cdc-rabbitmq/rabbitmq"
 	"github.com/ezeql/go-pq-cdc-rabbitmq/rabbitmq/publisher"
 	"github.com/prometheus/client_golang/prometheus"
+	amqp "github.com/rabbitmq/amqp091-go"
 )
 
 // operationSuffix avoids per-message string concatenation when building routing keys.
@@ -98,9 +99,18 @@ func NewConnector(ctx context.Context, cfg config.Connector, handler Handler, op
 
 	Options(options).Apply(rm)
 
-	// AMQP side first: if the CDC connector fails to build, only it needs closing.
+	// CDC first: it initialises go-pq-cdc's global logger, which the AMQP
+	// client's reconnect goroutine logs through from the moment it starts.
+	pqCDC, err := cdc.NewConnector(ctx, rm.cfg.CDC, rm.listener)
+	if err != nil {
+		return nil, err
+	}
+	rm.cdc = pqCDC
+	rm.cfg.CDC = *pqCDC.GetConfig()
+
 	rmqClient, err := rabbitmq.NewClient(rm.cfg)
 	if err != nil {
+		pqCDC.Close()
 		return nil, fmt.Errorf("rabbitmq new client: %w", err)
 	}
 	rm.client = rmqClient
@@ -112,17 +122,9 @@ func NewConnector(ctx context.Context, cfg config.Connector, handler Handler, op
 	rm.publisher, err = publisher.NewPublisher(rmqClient, rm.cfg, rm.responseHandler)
 	if err != nil {
 		_ = rmqClient.Close()
+		pqCDC.Close()
 		return nil, err
 	}
-
-	pqCDC, err := cdc.NewConnector(ctx, rm.cfg.CDC, rm.listener)
-	if err != nil {
-		rm.publisher.Close()
-		_ = rmqClient.Close()
-		return nil, err
-	}
-	rm.cdc = pqCDC
-	rm.cfg.CDC = *pqCDC.GetConfig()
 
 	pqCDC.SetMetricCollectors(rm.publisher.GetMetric().PrometheusCollectors()...)
 	pqCDC.SetMetricCollectors(rm.metrics...)
@@ -130,10 +132,11 @@ func NewConnector(ctx context.Context, cfg config.Connector, handler Handler, op
 }
 
 func (c *connector) Start(ctx context.Context) {
+	// The ticker runs from the start: snapshot rows arrive before the stream is
+	// ready, and an instance that never becomes ready must still flush them.
+	c.publisher.StartBatch()
 	if c.cfg.CDC.IsSnapshotOnlyMode() {
 		logger.Info("starting snapshot-only mode")
-		logger.Info("bulk process started")
-		c.publisher.StartBatch()
 		c.signalReady()
 		c.cdc.Start(ctx)
 		logger.Info("snapshot-only mode completed")
@@ -147,8 +150,6 @@ func (c *connector) Start(ctx context.Context) {
 			logger.Warn("connector did not become ready", "error", err)
 			return
 		}
-		logger.Info("bulk process started")
-		c.publisher.StartBatch()
 		c.signalReady()
 	}()
 	c.cdc.Start(ctx)
@@ -217,6 +218,11 @@ func (c *connector) listener(ctx *replication.ListenerContext) {
 	for i := range events {
 		if events[i].RoutingKey == "" {
 			events[i].RoutingKey = routingKey
+		}
+		// amqp rejects these at publish time and retrying cannot fix them:
+		// fail before any chunk of this event is buffered.
+		if err := amqp.Table(events[i].Headers).Validate(); err != nil {
+			panic(fmt.Errorf("invalid AMQP headers for routing key %q: %w", events[i].RoutingKey, err))
 		}
 	}
 
@@ -350,8 +356,8 @@ func (c *connector) renderParsedTemplate(t *template.Template, schema, table str
 	buf.Reset()
 	defer bufPool.Put(buf)
 	if err := t.Execute(buf, data); err != nil {
-		logger.Error("render routing key, event skipped", "template", t.Name(), "table", schema+"."+table, "error", err)
-		return "", err
+		// Acking the event would lose it; crash so it is redelivered once fixed.
+		panic(fmt.Errorf("render routing key %q for %s.%s: %w", t.Name(), schema, table, err))
 	}
 	return buf.String(), nil
 }
@@ -381,7 +387,7 @@ func parseRoutingTemplate(name, tpl string) (*template.Template, error) {
 	if err != nil {
 		return nil, err
 	}
-	data := routingTemplateData{TableNamespace: "public", TableName: "t", Operation: string(InsertMessage)}
+	data := routingTemplateData{TableNamespace: "public", TableName: "sample_table", Operation: string(InsertMessage)}
 	if err := t.Execute(io.Discard, data); err != nil {
 		return nil, err
 	}

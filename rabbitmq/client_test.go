@@ -15,7 +15,7 @@ func TestDialRejectsInsecureTLSConfig(t *testing.T) {
 	}{
 		"plaintext scheme": {url: "amqp://localhost:5672/", tls: config.TLSConfig{Enabled: true}, errSub: "amqps://"},
 		"bad CA PEM":       {url: "amqps://localhost:5671/", tls: config.TLSConfig{Enabled: true, CACert: []byte("nope")}, errSub: "caCert"},
-		"cert without key": {url: "amqps://localhost:5671/", tls: config.TLSConfig{Enabled: true, Cert: []byte("x")}, errSub: "tls"},
+		"cert without key": {url: "amqps://localhost:5671/", tls: config.TLSConfig{Enabled: true, Cert: []byte("x")}, errSub: "PEM data"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			c := &client{cfg: &config.Connector{RabbitMQ: config.RabbitMQ{URL: tc.url, TLS: tc.tls}}}

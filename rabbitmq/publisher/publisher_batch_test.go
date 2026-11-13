@@ -103,17 +103,11 @@ func TestWaitConfirms(t *testing.T) {
 	}
 }
 
-func TestAddEventsRejectsInvalidHeaders(t *testing.T) {
-	b := newBatch(time.Hour, 100, 1<<20, 1, "ex", nil, nil, "slot")
-	defer b.batchTicker.Stop()
-	defer func() {
-		if recover() == nil {
-			t.Fatal("unsupported header type must panic before buffering")
-		}
-		if len(b.messages) != 0 {
-			t.Fatalf("nothing may be buffered, got %d", len(b.messages))
-		}
-	}()
-	var n int
-	b.AddEvents(countingCtx(&n), []rabbitmq.PublishMessage{{Headers: map[string]any{"lsn": uint64(1)}}}, time.Now(), true)
+func TestIsPermanent(t *testing.T) {
+	if !isPermanent(&amqp.Error{Code: amqp.NotFound}) {
+		t.Fatal("404 from the broker cannot be fixed by retrying")
+	}
+	if isPermanent(amqp.ErrClosed) || isPermanent(context.DeadlineExceeded) {
+		t.Fatal("disconnects and timeouts must be retried")
+	}
 }
