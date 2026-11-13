@@ -151,8 +151,9 @@ func (c *connector) WaitUntilReady(ctx context.Context) error {
 func (c *connector) Close() {
 	c.closeOnce.Do(func() {
 		c.signalReady()
-		c.cdc.Close()
+		// Flush and ack before the stream sends its final status update on close.
 		c.publisher.Close()
+		c.cdc.Close()
 		if err := c.client.Close(); err != nil {
 			logger.Error("rabbitmq client close", "error", err)
 		}
@@ -171,31 +172,21 @@ func (c *connector) listener(ctx *replication.ListenerContext) {
 	case *format.Snapshot:
 		msg = NewSnapshotMessage(m)
 	default:
+		// Relation, Truncate, logical messages: nothing to publish, still acked.
+		c.publisher.Ack(ctx)
 		return
 	}
 
 	fullTableName := c.getFullTableName(msg.TableNamespace, msg.TableName)
 	routingKey, ok := c.resolveTableToRoutingKey(fullTableName, msg.TableNamespace, msg.TableName, msg.Type)
 	if !ok {
-		if c.publisher.HasPendingMessages() {
-			logger.Warn("skipping ACK - pending messages in batch", "table", fullTableName)
-			return
-		}
-		if err := ctx.Ack(); err != nil {
-			logger.Error("ack", "error", err)
-		}
+		c.publisher.Ack(ctx)
 		return
 	}
 
 	events := c.handler(msg)
 	if len(events) == 0 {
-		if c.publisher.HasPendingMessages() {
-			logger.Warn("skipping ACK - pending messages in batch", "table", fullTableName)
-			return
-		}
-		if err := ctx.Ack(); err != nil {
-			logger.Error("ack", "error", err)
-		}
+		c.publisher.Ack(ctx)
 		return
 	}
 

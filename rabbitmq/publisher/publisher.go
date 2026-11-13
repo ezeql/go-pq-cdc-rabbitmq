@@ -63,6 +63,6 @@ func (p *Publisher) GetMetric() Metric {
 	return p.PublisherBatch.metric
 }
 
-func (p *Publisher) HasPendingMessages() bool {
-	return p.PublisherBatch.HasPendingMessages()
+func (p *Publisher) Ack(ctx *replication.ListenerContext) {
+	p.PublisherBatch.Ack(ctx)
 }

@@ -3,9 +3,7 @@ package publisher
 import (
 	"context"
 	"fmt"
-	"math"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/Trendyol/go-pq-cdc/logger"
@@ -15,16 +13,18 @@ import (
 )
 
 type Batch struct {
-	metric              Metric
-	client              rabbitmq.Client
-	responseHandler     rabbitmq.ResponseHandler
-	batchTicker         *time.Ticker
-	lastAckCtx          *replication.ListenerContext
-	lastChannel         *amqp.Channel
-	confirmTimeout      *time.Timer
-	confirmsCh          chan amqp.Confirmation
-	defaultExchange     string
-	messages            []rabbitmq.PublishMessage
+	metric          Metric
+	client          rabbitmq.Client
+	responseHandler rabbitmq.ResponseHandler
+	batchTicker     *time.Ticker
+	lastChannel     *amqp.Channel
+	confirmTimeout  *time.Timer
+	confirmsCh      chan amqp.Confirmation
+	defaultExchange string
+	messages        []rabbitmq.PublishMessage
+	// acks holds every delivered message not yet acked. go-pq-cdc confirms the
+	// WAL end on idle keepalives only once each delivery has been acked.
+	acks                []*replication.ListenerContext
 	routingKeys         []string
 	batchLimit          int
 	currentMessageBytes int64
@@ -32,8 +32,8 @@ type Batch struct {
 	batchBytes          int64
 	batchTickerDuration time.Duration
 	flushLock           sync.Mutex
-	pendingFlag         atomic.Bool
-	messageCount        atomic.Int32
+	// pending is true from AddEvents until a flush succeeds.
+	pending bool
 }
 
 func newBatch(
@@ -77,10 +77,25 @@ func (b *Batch) Close() {
 	b.FlushMessages()
 }
 
-// HasPendingMessages returns true if there are unacknowledged messages.
-// Uses atomics instead of the flush mutex to avoid lock contention on the hot path.
-func (b *Batch) HasPendingMessages() bool {
-	return b.messageCount.Load() > 0 || b.pendingFlag.Load()
+// Ack acks a delivery that published nothing (unmapped table, empty handler
+// result, Relation/Truncate/logical message). Acking it while earlier rows are
+// still unpublished would confirm past them, so it then waits for their flush.
+func (b *Batch) Ack(ctx *replication.ListenerContext) {
+	b.flushLock.Lock()
+	if !b.pending {
+		b.flushLock.Unlock()
+		if err := ctx.Ack(); err != nil {
+			logger.Error("ack", "error", err)
+		}
+		return
+	}
+	b.acks = append(b.acks, ctx)
+	shouldFlush := len(b.acks) >= b.batchLimit
+	b.flushLock.Unlock()
+
+	if shouldFlush {
+		b.FlushMessages()
+	}
 }
 
 func (b *Batch) AddEvents(
@@ -95,12 +110,11 @@ func (b *Batch) AddEvents(
 		b.routingKeys = append(b.routingKeys, messages[i].RoutingKey)
 		b.currentMessageBytes += totalSizeOfMessage(&messages[i])
 	}
-	b.pendingFlag.Store(true)
-	b.messageCount.Store(int32(min(len(b.messages), math.MaxInt32))) //nolint:gosec // G115: clamped to MaxInt32
+	b.pending = true
 	if isLastChunk {
-		b.lastAckCtx = ctx
+		b.acks = append(b.acks, ctx)
 	}
-	shouldFlush := len(b.messages) >= b.batchLimit || b.currentMessageBytes >= b.batchBytes
+	shouldFlush := len(b.messages) >= b.batchLimit || b.currentMessageBytes >= b.batchBytes || len(b.acks) >= b.batchLimit
 	b.flushLock.Unlock()
 
 	if isLastChunk {
@@ -145,16 +159,16 @@ func (b *Batch) FlushMessages() {
 	b.messages = b.messages[:0]
 	b.routingKeys = b.routingKeys[:0]
 	b.currentMessageBytes = 0
-	b.messageCount.Store(0)
 
 	if flushSuccess {
-		b.pendingFlag.Store(false)
-		if b.lastAckCtx != nil {
-			if ackErr := b.lastAckCtx.Ack(); ackErr != nil {
+		b.pending = false
+		for _, ctx := range b.acks {
+			if ackErr := ctx.Ack(); ackErr != nil {
 				logger.Error("ack", "error", ackErr)
 			}
-			b.lastAckCtx = nil
 		}
+		clear(b.acks)
+		b.acks = b.acks[:0]
 	} else {
 		logger.Warn("flush failed, skipping ACK to preserve message ordering")
 	}
