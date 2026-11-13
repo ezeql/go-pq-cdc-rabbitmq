@@ -99,6 +99,44 @@ func main() {
 }
 ```
 
+Runnable examples with docker-compose: [`example/simple`](example/simple) and
+[`example/snapshot`](example/snapshot).
+
+## Configuration
+
+`config.Connector` has two parts: `CDC` is the
+[go-pq-cdc config](https://github.com/Trendyol/go-pq-cdc) (connection,
+publication, slot, snapshot) and `RabbitMQ` is this connector's.
+`NewConnector` fills in defaults, then rejects invalid values at startup.
+
+| `rabbitmq.*` | Default | Notes |
+| --- | --- | --- |
+| `url` | `amqp://guest:guest@localhost:5672/` | Must be `amqps://` when `tls.enabled` |
+| `connectionName` | | Shown in the RabbitMQ management UI |
+| `connectionTimeout` | `30s` | Dial timeout |
+| `heartbeat` | `10s` | AMQP heartbeat |
+| `exchange.name` / `exchange.type` | `cdc.events` / `topic` | Always declared durable |
+| `exchange.arguments` | | Passed to `ExchangeDeclare` |
+| `exchange.deadLetter` | | Declares a topic exchange and an optional bound queue; queues still need `x-dead-letter-exchange` in their `arguments` |
+| `queues[]` | | Declared (always durable) and bound to the exchange by `bindings` |
+| `routingKeyTemplate` | `{{.TableNamespace}}.{{.TableName}}.{{.Operation}}` | Used when `tableRoutingKeyMapping` is empty |
+| `tableRoutingKeyMapping` | | See [Exchange and Routing](#exchange-and-routing) |
+| `publisherBatchSize` | `2000` | Flush after this many messages |
+| `publisherBatchBytes` | `1mb` | Flush after this many bytes (`b`, `kb`, `mb`, `gb`, `tb`; case-insensitive, decimals allowed) |
+| `publisherBatchTickerDuration` | `10s` | Flush at least this often |
+| `publisherMaxRetries` | unlimited | Retries of a failed batch; permanent errors (404, 403, 406) are not retried |
+| `reconnectInterval` / `reconnectMaxInterval` | `1s` / `30s` | Reconnect backoff with jitter |
+| `reconnectMaxElapsed` | `0` (forever) | Stop the background reconnect loop after this long |
+| `tls` | | `enabled`, `caCert`, `cert` + `key` (PEM, both or neither), `insecure` |
+
+Options:
+
+- `cdc.WithResponseHandler(h)`: called per published message (`OnSuccess`,
+  `OnError`). The default panics on permanent errors and logs the rest.
+- `cdc.WithPrometheusMetrics(collectors)`: extra collectors for the go-pq-cdc
+  metrics endpoint.
+- `cdc.WithLogger(l)`: logger for both go-pq-cdc and this connector.
+
 ## Exchange and Routing
 
 By default, each event resolves to a routing key:
