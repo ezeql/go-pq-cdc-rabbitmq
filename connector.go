@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"strings"
 	"sync"
 	"text/template"
@@ -76,7 +77,7 @@ func NewConnector(ctx context.Context, cfg config.Connector, handler Handler, op
 	rm.templateMappings = make(map[string]*template.Template, len(cfg.RabbitMQ.TableRoutingKeyMapping))
 	for k, v := range cfg.RabbitMQ.TableRoutingKeyMapping {
 		if strings.Contains(v, "{{") {
-			t, err := template.New("routingKey:" + k).Parse(v)
+			t, err := parseRoutingTemplate("routingKey:"+k, v)
 			if err != nil {
 				return nil, fmt.Errorf("invalid routing key template for %q: %w", k, err)
 			}
@@ -86,15 +87,15 @@ func NewConnector(ctx context.Context, cfg config.Connector, handler Handler, op
 		}
 	}
 
+	if len(cfg.RabbitMQ.TableRoutingKeyMapping) == 0 {
+		if _, err := parseRoutingTemplate("routingKey", cfg.RabbitMQ.RoutingKeyTemplate); err != nil {
+			return nil, fmt.Errorf("invalid routingKeyTemplate: %w", err)
+		}
+	}
+
 	Options(options).Apply(rm)
 
-	pqCDC, err := cdc.NewConnector(ctx, rm.cfg.CDC, rm.listener)
-	if err != nil {
-		return nil, err
-	}
-	rm.cdc = pqCDC
-	rm.cfg.CDC = *pqCDC.GetConfig()
-
+	// AMQP side first: if the CDC connector fails to build, only it needs closing.
 	rmqClient, err := rabbitmq.NewClient(rm.cfg)
 	if err != nil {
 		return nil, fmt.Errorf("rabbitmq new client: %w", err)
@@ -107,9 +108,18 @@ func NewConnector(ctx context.Context, cfg config.Connector, handler Handler, op
 
 	rm.publisher, err = publisher.NewPublisher(rmqClient, rm.cfg, rm.responseHandler)
 	if err != nil {
-		logger.Error("rabbitmq new publisher", "error", err)
+		_ = rmqClient.Close()
 		return nil, err
 	}
+
+	pqCDC, err := cdc.NewConnector(ctx, rm.cfg.CDC, rm.listener)
+	if err != nil {
+		rm.publisher.Close()
+		_ = rmqClient.Close()
+		return nil, err
+	}
+	rm.cdc = pqCDC
+	rm.cfg.CDC = *pqCDC.GetConfig()
 
 	pqCDC.SetMetricCollectors(rm.publisher.GetMetric().PrometheusCollectors()...)
 	pqCDC.SetMetricCollectors(rm.metrics...)
@@ -130,7 +140,9 @@ func (c *connector) Start(ctx context.Context) {
 	go func() {
 		logger.Info("waiting for connector start...")
 		if err := c.cdc.WaitUntilReady(ctx); err != nil {
-			panic(err)
+			// ctx cancelled before the stream was ready (e.g. shutdown mid-snapshot).
+			logger.Warn("connector did not become ready", "error", err)
+			return
 		}
 		logger.Info("bulk process started")
 		c.publisher.StartBatch()
@@ -170,6 +182,15 @@ func (c *connector) listener(ctx *replication.ListenerContext) {
 	case *format.Delete:
 		msg = NewDeleteMessage(m)
 	case *format.Snapshot:
+		if m.EventType != format.SnapshotEventTypeData {
+			// BEGIN/END markers carry no table or row. go-pq-cdc ignores snapshot
+			// acks, so publish what is buffered once the snapshot ends.
+			if m.EventType == format.SnapshotEventTypeEnd {
+				c.publisher.PublisherBatch.FlushMessages()
+			}
+			c.publisher.Ack(ctx)
+			return
+		}
 		msg = NewSnapshotMessage(m)
 	default:
 		// Relation, Truncate, logical messages: nothing to publish, still acked.
@@ -292,7 +313,9 @@ func (c *connector) findParentTable(tableNamespace, tableName string) string {
 	if len(tableParts) <= 1 {
 		return ""
 	}
-	for i := 1; i < len(tableParts); i++ {
+	// Longest prefix first: with "events" and "events_archive" both mapped,
+	// "events_archive_2024" belongs to "events_archive".
+	for i := len(tableParts) - 1; i >= 1; i-- {
 		parentNameCandidate := strings.Join(tableParts[:i], "_")
 		fullParentName := c.getFullTableName(tableNamespace, parentNameCandidate)
 		if _, exists := c.cfg.RabbitMQ.TableRoutingKeyMapping[fullParentName]; exists {
@@ -315,11 +338,7 @@ func (c *connector) renderTemplate(tpl, schema, table string, op MessageType) (s
 }
 
 func (c *connector) renderParsedTemplate(t *template.Template, schema, table string, op MessageType) (string, error) {
-	data := struct {
-		TableNamespace string
-		TableName      string
-		Operation      string
-	}{
+	data := routingTemplateData{
 		TableNamespace: schema,
 		TableName:      table,
 		Operation:      string(op),
@@ -328,6 +347,7 @@ func (c *connector) renderParsedTemplate(t *template.Template, schema, table str
 	buf.Reset()
 	defer bufPool.Put(buf)
 	if err := t.Execute(buf, data); err != nil {
+		logger.Error("render routing key, event skipped", "template", t.Name(), "table", schema+"."+table, "error", err)
 		return "", err
 	}
 	return buf.String(), nil
@@ -341,13 +361,34 @@ func (c *connector) getOrCreateRoutingTemplate(tpl string) (*template.Template, 
 		}
 	}
 
-	parsed, err := template.New("routingKey").Parse(tpl)
+	parsed, err := parseRoutingTemplate("routingKey", tpl)
 	if err != nil {
 		return nil, err
 	}
 	actual, _ := c.routingTemplateCache.LoadOrStore(tpl, parsed)
 	t, _ := actual.(*template.Template)
 	return t, nil
+}
+
+// parseRoutingTemplate parses tpl and renders it once, so a template that parses
+// but cannot execute (e.g. {{.Table}}) fails at startup instead of silently
+// dropping every event.
+func parseRoutingTemplate(name, tpl string) (*template.Template, error) {
+	t, err := template.New(name).Parse(tpl)
+	if err != nil {
+		return nil, err
+	}
+	data := routingTemplateData{TableNamespace: "public", TableName: "t", Operation: string(InsertMessage)}
+	if err := t.Execute(io.Discard, data); err != nil {
+		return nil, err
+	}
+	return t, nil
+}
+
+type routingTemplateData struct {
+	TableNamespace string
+	TableName      string
+	Operation      string
 }
 
 func (c *connector) signalReady() {

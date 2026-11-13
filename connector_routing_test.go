@@ -20,7 +20,7 @@ func newRoutingTestConnector(cfg config.Connector) *connector {
 	}
 	for k, v := range cfg.RabbitMQ.TableRoutingKeyMapping {
 		if strings.Contains(v, "{{") {
-			t, err := template.New("routingKey:" + k).Parse(v)
+			t, err := parseRoutingTemplate("routingKey:"+k, v)
 			if err != nil {
 				panic(err)
 			}
