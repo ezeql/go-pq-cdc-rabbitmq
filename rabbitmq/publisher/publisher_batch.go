@@ -34,6 +34,8 @@ type Batch struct {
 	flushLock           sync.Mutex
 	// pending is true from AddEvents until a flush succeeds.
 	pending bool
+	closed  bool
+	done    chan struct{}
 }
 
 func newBatch(
@@ -61,20 +63,34 @@ func newBatch(
 		defaultExchange:     defaultExchange,
 		client:              client,
 		confirmTimeout:      t,
+		done:                make(chan struct{}),
 	}
 }
 
 func (b *Batch) StartBatchTicker() {
 	go func() {
-		for range b.batchTicker.C {
-			b.FlushMessages()
+		for {
+			select {
+			case <-b.batchTicker.C:
+				b.FlushMessages()
+			case <-b.done:
+				return
+			}
 		}
 	}()
 }
 
+// Close flushes what is buffered and stops publishing. Rows delivered after
+// Close stay unacked and are redelivered on restart.
 func (b *Batch) Close() {
-	b.batchTicker.Stop()
 	b.FlushMessages()
+	b.flushLock.Lock()
+	defer b.flushLock.Unlock()
+	if !b.closed {
+		b.closed = true
+		b.batchTicker.Stop()
+		close(b.done)
+	}
 }
 
 // Ack acks a delivery that published nothing (unmapped table, empty handler
@@ -129,7 +145,7 @@ func (b *Batch) FlushMessages() {
 	b.flushLock.Lock()
 	defer b.flushLock.Unlock()
 
-	if len(b.messages) == 0 {
+	if b.closed || len(b.messages) == 0 {
 		return
 	}
 
@@ -156,11 +172,10 @@ func (b *Batch) FlushMessages() {
 		b.handleResponseError(err)
 	}
 
-	b.messages = b.messages[:0]
-	b.routingKeys = b.routingKeys[:0]
-	b.currentMessageBytes = 0
-
 	if flushSuccess {
+		b.messages = b.messages[:0]
+		b.routingKeys = b.routingKeys[:0]
+		b.currentMessageBytes = 0
 		b.pending = false
 		for _, ctx := range b.acks {
 			if ackErr := ctx.Ack(); ackErr != nil {
@@ -170,7 +185,10 @@ func (b *Batch) FlushMessages() {
 		clear(b.acks)
 		b.acks = b.acks[:0]
 	} else {
-		logger.Warn("flush failed, skipping ACK to preserve message ordering")
+		// Keep the batch: dropping it would let the next successful flush
+		// confirm past rows RabbitMQ never accepted. Retried on the next flush,
+		// so rows already confirmed in this batch may be published twice.
+		logger.Warn("flush failed, keeping batch for retry, nothing acked")
 	}
 
 	b.batchTicker.Reset(b.batchTickerDuration)

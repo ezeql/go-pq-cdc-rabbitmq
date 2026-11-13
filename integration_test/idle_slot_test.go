@@ -13,7 +13,7 @@ import (
 
 // go-pq-cdc confirms the server WAL end on an idle keepalive only once every
 // delivered message has been acked. A single lost ack (a non-last row of a
-// batch, a Relation message, a filtered row) pins the slot and WAL piles up.
+// batch, a Relation message) pins the slot and WAL piles up.
 func TestConnector_IdleSlotFollowsWALEnd(t *testing.T) {
 	ctx := context.Background()
 	db := mustOpenDB(t)
@@ -42,14 +42,17 @@ func TestConnector_IdleSlotFollowsWALEnd(t *testing.T) {
 	require.NoError(t, connector.WaitUntilReady(readyCtx))
 
 	// One transaction, three rows: one batch, one Relation message.
-	_, err = db.ExecContext(ctx, `INSERT INTO users (name, email) VALUES ('I1','i1@acme.io'),('I2','i2@acme.io'),('I3','i3@acme.io')`)
-	require.NoError(t, err)
 	conn, err := amqp.Dial(cfg.RabbitMQ.URL)
 	require.NoError(t, err)
 	defer conn.Close()
 	ch, err := conn.Channel()
 	require.NoError(t, err)
 	defer ch.Close()
+	_, err = ch.QueuePurge("users_idle_queue", false) // durable: a rerun finds the last run's rows
+	require.NoError(t, err)
+
+	_, err = db.ExecContext(ctx, `INSERT INTO users (name, email) VALUES ('I1','i1@acme.io'),('I2','i2@acme.io'),('I3','i3@acme.io')`)
+	require.NoError(t, err)
 	require.Eventually(t, func() bool {
 		q, err := ch.QueueDeclarePassive("users_idle_queue", true, false, false, false, nil)
 		return err == nil && q.Messages == 3
