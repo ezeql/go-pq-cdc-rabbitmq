@@ -118,6 +118,7 @@ func TestValidateRejectsNegativeValues(t *testing.T) {
 		"ticker":      func(c *config.Connector) { c.RabbitMQ.PublisherBatchTickerDuration = -time.Second },
 		"max retries": func(c *config.Connector) { c.RabbitMQ.PublisherMaxRetries = -1 },
 		"reconnect":   func(c *config.Connector) { c.RabbitMQ.ReconnectInterval = -time.Second },
+		"heartbeat":   func(c *config.Connector) { c.CDC.Heartbeat.Table.Name = "hb" },
 	} {
 		t.Run(name, func(t *testing.T) {
 			c := config.Connector{}

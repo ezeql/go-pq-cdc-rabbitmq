@@ -126,6 +126,12 @@ func (c *Connector) Validate() error {
 	if r.ReconnectInterval < 0 || r.ReconnectMaxInterval < 0 || r.ReconnectMaxElapsed < 0 {
 		err = errors.Join(err, errors.New("rabbitmq reconnect durations must be >= 0"))
 	}
+	if c.CDC.IsHeartbeatEnabled() {
+		// go-pq-cdc acks heartbeat rows itself, before the listener, which
+		// confirms past rows still buffered here: a crash then loses them.
+		// Since go-pq-cdc v1.14 idle slots advance on keepalives instead.
+		err = errors.Join(err, errors.New("cdc.heartbeat is not supported: its auto-ack confirms past unpublished rows"))
+	}
 	if r.ConnectionTimeout < 0 || r.Heartbeat < 0 {
 		err = errors.Join(err, errors.New("rabbitmq.connectionTimeout and rabbitmq.heartbeat must be >= 0"))
 	}

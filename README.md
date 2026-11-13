@@ -132,7 +132,11 @@ confirmed every row at or below it; a failed or unconfirmed batch is kept and
 retried, so consumers can see duplicates and should be idempotent. A broker
 nack is fatal with the default response handler.
 
-Known gaps, both in go-pq-cdc and outside this connector's control:
+`cdc.heartbeat` is rejected: go-pq-cdc acks heartbeat rows itself, which
+confirms past rows still buffered in the publisher. Since go-pq-cdc v1.14 an
+idle slot advances on keepalives, which covers what the heartbeat was for.
+
+Known gap in go-pq-cdc, outside this connector's control:
 
 - **Initial snapshot:** go-pq-cdc marks a snapshot chunk done once its rows are
   handed over, before they are published. A crash in that window loses those
